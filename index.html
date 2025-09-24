@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Google Drive Video Uploader & Viewer</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        #auth-status { margin-bottom: 20px; }
+        #auth-status button { margin-right: 10px; padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; }
+        #authorize_button { background-color: #4285F4; color: white; }
+        #signout_button { background-color: #ea4335; color: white; }
+        #content { background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-top: 20px; }
+        .hidden { display: none; }
+        input[type="file"] { margin-bottom: 10px; padding: 5px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 8px 12px; background-color: #34A853; color: white; border: none; border-radius: 5px; cursor: pointer; margin-top: 10px; }
+        button:hover:not(:disabled) { opacity: 0.9; }
+        button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        #videoList { list-style: none; padding: 0; margin-top: 20px; }
+        #videoList li { padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; background-color: #fcfcfc; border-radius: 4px; margin-bottom: 5px;}
+        #videoList li:last-child { border-bottom: none; }
+        #videoList li button { background-color: #4285F4; margin-top: 0; margin-left: 10px; }
+        #videoPlayer { width: 100%; max-width: 600px; margin-top: 20px; border-radius: 8px; overflow: hidden; display: block; background-color: #000; }
+        #uploadProgress { width: 100%; height: 20px; background-color: #ddd; margin-top: 10px; border-radius: 5px; overflow: hidden; }
+        #uploadProgressBar { height: 100%; width: 0%; background-color: #4CAF50; text-align: center; line-height: 20px; color: white; font-size: 12px; transition: width 0.2s ease-in-out; }
+        .error-message { color: red; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Google Drive Video Uploader & Viewer</h1>
+
+    <div id="auth-status">
+        <p>Google Drive तक पहुंचने के लिए साइन इन करें:</p>
+        <button id="authorize_button" class="hidden">अधिकृत करें</button>
+        <button id="signout_button" class="hidden">साइन आउट करें</button>
+    </div>
+
+    <div id="content" class="hidden">
+        <h2>वीडियो अपलोड करें</h2>
+        <input type="file" id="videoFileInput" accept="video/*">
+        <button id="uploadButton">ड्राइव पर अपलोड करें</button>
+        <div id="uploadProgress" class="hidden">
+            <div id="uploadProgressBar">0%</div>
+        </div>
+        <p id="uploadStatus"></p>
+
+        <h2>ड्राइव वीडियो</h2>
+        <button id="refreshVideosButton">वीडियो रीफ्रेश करें</button>
+        <ul id="videoList">
+            <!-- Videos will be listed here -->
+        </ul>
+
+        <h2>वीडियो प्लेयर</h2>
+        <video id="videoPlayer" controls class="hidden"></video>
+    </div>
+
+    <script type="text/javascript">
+        // =========================================================================
+        // महत्वपूर्ण: आपको अपना वेब एप्लिकेशन क्लाइंट ID यहां पेस्ट करना होगा।
+        // आपने जो ID प्रदान की है वह Android ऐप्स के लिए है और वेब ऐप के लिए काम नहीं करेगी।
+        // Google Cloud Console पर जाएँ -> APIs & Services -> Credentials -> Create Credentials -> OAuth client ID
+        // एप्लिकेशन प्रकार के रूप में "Web application" चुनें।
+        // JavaScript Origins में अपनी होस्टिंग URL (जैसे http://localhost:8000 या https://yourdomain.com) जोड़ना सुनिश्चित करें।
+        // =========================================================================
+        const CLIENT_ID = "533925715683-vi41bn4kd492if51ug0t4kd27ueh8c8h.apps.googleusercontent.com"; // <-- इसे अपने वेब एप्लिकेशन CLIENT_ID से बदलें
+
+        const DISCOVERY_DOCS = ["https://www.googleapis.com/discovery/v1/apis/drive/v3/rest"];
+
+        const SCOPES = 'https://www.googleapis.com/auth/drive'; // पूर्ण ड्राइव एक्सेस के लिए
+
+        // =========================================================================
+        // UI एलिमेंट्स
+        // =========================================================================
+        let authorizeButton = document.getElementById('authorize_button');
+        let signoutButton = document.getElementById('signout_button');
+        let contentDiv = document.getElementById('content');
+        let videoFileInput = document.getElementById('videoFileInput');
+        let uploadButton = document.getElementById('uploadButton');
+        let uploadProgressDiv = document.getElementById('uploadProgress');
+        let uploadProgressBar = document.getElementById('uploadProgressBar');
+        let uploadStatusText = document.getElementById('uploadStatus');
+        let refreshVideosButton = document.getElementById('refreshVideosButton');
+        let videoList = document.getElementById('videoList');
+        let videoPlayer = document.getElementById('videoPlayer');
+
+        /**
+         *  लोड होने पर, auth2 लाइब्रेरी और API क्लाइंट लाइब्रेरी लोड करने के लिए कहा जाता है।
+         */
+        function handleClientLoad() {
+            gapi.load('client:auth2', initClient);
+        }
+
+        /**
+         *  API क्लाइंट लाइब्रेरी को इनिशियलाइज़ करता है और साइन-इन स्थिति लिसनर्स सेट अप करता है।
+         */
+        async function initClient() {
+            try {
+                await gapi.client.init({
+                    clientId: CLIENT_ID,
+                    discoveryDocs: DISCOVERY_DOCS,
+                    scope: SCOPES,
+                });
+
+                // साइन-इन स्थिति परिवर्तनों के लिए सुनें।
+                gapi.auth2.getAuthInstance().isSignedIn.listen(updateSigninStatus);
+
+                // प्रारंभिक साइन-इन स्थिति को संभालें।
+                updateSigninStatus(gapi.auth2.getAuthInstance().isSignedIn.get());
+
+                // इवेंट लिसनर्स सेट करें
+                authorizeButton.onclick = handleAuthClick;
+                signoutButton.onclick = handleSignoutClick;
+                uploadButton.onclick = uploadVideo;
+                refreshVideosButton.onclick = listDriveVideos;
+
+            } catch (error) {
+                console.error('GAPI क्लाइंट लोड करने में त्रुटि', error);
+                uploadStatusText.className = 'error-message';
+                uploadStatusText.innerText = 'Google API लोड करने में त्रुटि: ' + (error.details || error.message) + '. सुनिश्चित करें कि आपका CLIENT_ID एक "Web application" प्रकार का है और Google Cloud Console में सही ढंग से कॉन्फ़िगर किया गया है (JavaScript Origins सहित)।';
+            }
+        }
+
+        /**
+         *  साइन-इन स्थिति बदलने पर बुलाया जाता है।
+         */
+        function updateSigninStatus(isSignedIn) {
+            if (isSignedIn) {
+                authorizeButton.classList.add('hidden');
+                signoutButton.classList.remove('hidden');
+                contentDiv.classList.remove('hidden');
+                uploadButton.disabled = false;
+                listDriveVideos();
+            } else {
+                authorizeButton.classList.remove('hidden');
+                signoutButton.classList.add('hidden');
+                contentDiv.classList.add('hidden');
+                videoList.innerHTML = '';
+                uploadButton.disabled = true;
+                videoPlayer.classList.add('hidden');
+                videoPlayer.pause();
+                videoPlayer.removeAttribute('src'); // प्लेयर को रीसेट करें
+            }
+        }
+
+        /**
+         *  बटन क्लिक पर उपयोगकर्ता को साइन इन करें।
+         */
+        function handleAuthClick() {
+            gapi.auth2.getAuthInstance().signIn();
+        }
+
+        /**
+         *  बटन क्लिक पर उपयोगकर्ता को साइन आउट करें।
+         */
+        function handleSignoutClick() {
+            gapi.auth2.getAuthInstance().signOut();
+        }
+
+        /**
+         * XMLHttpRequest का उपयोग करके चयनित वीडियो फ़ाइल को Google Drive पर रेज़्यूमेबल अपलोड करता है।
+         */
+        async function uploadVideo() {
+            const file = videoFileInput.files[0];
+            if (!file) {
+                uploadStatusText.className = 'error-message';
+                uploadStatusText.innerText = 'कृपया एक वीडियो फ़ाइल चुनें।';
+                return;
+            }
+
+            uploadButton.disabled = true;
+            videoFileInput.disabled = true;
+            uploadProgressDiv.classList.remove('hidden');
+            uploadStatusText.className = '';
+            uploadStatusText.innerText = 'अपलोड शुरू कर रहा है...';
+            uploadProgressBar.style.width = '0%';
+            uploadProgressBar.innerText = '0%';
+
+            try {
+                const metadata = {
+                    name: file.name,
+                    mimeType: file.type || 'video/mp4',
+                };
+
+                const accessToken = gapi.auth2.getAuthInstance().currentUser.get().getAuthResponse().access_token;
+
+                // चरण 1: रेज़्यूमेबल अपलोड शुरू करें (मेटाडेटा भेजें)
+                const initResumableXhr = new XMLHttpRequest();
+                initResumableXhr.open('POST', 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable', true);
+                initResumableXhr.setRequestHeader('Authorization', 'Bearer ' + accessToken);
+                initResumableXhr.setRequestHeader('Content-Type', 'application/json; charset=UTF-8');
+                initResumableXhr.setRequestHeader('X-Upload-Content-Type', file.type || 'video/mp4');
+                initResumableXhr.setRequestHeader('X-Upload-Content-Length', file.size);
+
+                initResumableXhr.onload = async () => {
+                    if (initResumableXhr.status === 200) {
+                        const locationUrl = initResumableXhr.getResponseHeader('Location');
+                        if (!locationUrl) {
+                            throw new Error('रेज़्यूमेबल अपलोड URL प्रतिक्रिया शीर्षलेखों में नहीं मिला।');
+                        }
+                        console.log('रेज़्यूमेबल सेशन URL:', locationUrl);
+                        uploadStatusText.innerText = 'अपलोड सत्र शुरू हो गया है। फ़ाइल स्थानांतरण शुरू कर रहा है...';
+
+                        // चरण 2: फ़ाइल डेटा अपलोड करें
+                        const uploadFileXhr = new XMLHttpRequest();
+                        uploadFileXhr.open('PUT', locationUrl, true);
+                        uploadFileXhr.setRequestHeader('Content-Type', file.type || 'video/mp4');
+                        uploadFileXhr.setRequestHeader('Content-Range', `bytes 0-${file.size - 1}/${file.size}`);
+
+                        uploadFileXhr.upload.addEventListener('progress', (e) => {
+                            if (e.lengthComputable) {
+                                const progress = (e.loaded / e.total) * 100;
+                                uploadProgressBar.style.width = progress.toFixed(0) + '%';
+                                uploadProgressBar.innerText = progress.toFixed(0) + '%';
+                                uploadStatusText.innerText = `अपलोड कर रहा है: ${progress.toFixed(0)}%`;
+                            }
+                        });
+
+                        uploadFileXhr.onload = () => {
+                            if (uploadFileXhr.status === 200 || uploadFileXhr.status === 201) {
+                                const uploadedFile = JSON.parse(uploadFileXhr.responseText);
+                                console.log('अपलोड प्रतिक्रिया:', uploadedFile);
+                                uploadStatusText.className = '';
+                                uploadStatusText.innerText = `अपलोड सफल: ${uploadedFile.name}`;
+                                uploadProgressBar.style.width = '100%';
+                                uploadProgressBar.innerText = '100%';
+                                setTimeout(() => uploadProgressDiv.classList.add('hidden'), 2000);
+                                listDriveVideos();
+                            } else {
+                                console.error('फ़ाइल अपलोड के दौरान त्रुटि:', uploadFileXhr);
+                                uploadStatusText.className = 'error-message';
+                                uploadStatusText.innerText = `फ़ाइल अपलोड विफल: ${uploadFileXhr.status} ${uploadFileXhr.statusText || ''} - ${uploadFileXhr.responseText ? JSON.parse(uploadFileXhr.responseText).error.message : ''}`;
+                            }
+                            uploadButton.disabled = false;
+                            videoFileInput.disabled = false;
+                        };
+
+                        uploadFileXhr.onerror = () => {
+                            console.error('फ़ाइल अपलोड के दौरान नेटवर्क त्रुटि।', uploadFileXhr);
+                            uploadStatusText.className = 'error-message';
+                            uploadStatusText.innerText = 'फ़ाइल अपलोड के दौरान नेटवर्क त्रुटि।';
+                            uploadButton.disabled = false;
+                            videoFileInput.disabled = false;
+                            uploadProgressDiv.classList.add('hidden');
+                        };
+
+                        uploadFileXhr.send(file);
+                    } else {
+                        console.error('रेज़्यूमेबल अपलोड शुरू करने में त्रुटि:', initResumableXhr);
+                        uploadStatusText.className = 'error-message';
+                        uploadStatusText.innerText = `अपलोड सत्र शुरू करने में विफल: ${initResumableXhr.status} ${initResumableXhr.statusText || ''} - ${initResumableXhr.responseText ? JSON.parse(initResumableXhr.responseText).error.message : ''}`;
+                        uploadButton.disabled = false;
+                        videoFileInput.disabled = false;
+                        uploadProgressDiv.classList.add('hidden');
+                    }
+                };
+
+                initResumableXhr.onerror = () => {
+                    console.error('रेज़्यूमेबल अपलोड शुरू करने में नेटवर्क त्रुटि।', initResumableXhr);
+                    uploadStatusText.className = 'error-message';
+                    uploadStatusText.innerText = 'अपलोड सत्र शुरू करने में नेटवर्क त्रुटि।';
+                    uploadButton.disabled = false;
+                    videoFileInput.disabled = false;
+                    uploadProgressDiv.classList.add('hidden');
+                };
+
+                initResumableXhr.send(JSON.stringify(metadata));
+            } catch (error) {
+                console.error('अपलोड सेटअप के दौरान सामान्य त्रुटि:', error);
+                uploadStatusText.className = 'error-message';
+                uploadStatusText.innerText = `अपलोड सेटअप विफल: ${error.message}`;
+                uploadButton.disabled = false;
+                videoFileInput.disabled = false;
+                uploadProgressDiv.classList.add('hidden');
+            }
+        }
+
+        /**
+         * Google Drive से वीडियो फ़ाइलें सूचीबद्ध करता है।
+         */
+        async function listDriveVideos() {
+            videoList.innerHTML = '<li>वीडियो लोड हो रहे हैं...</li>';
+            videoPlayer.classList.add('hidden');
+            videoPlayer.pause();
+            videoPlayer.removeAttribute('src');
+
+            try {
+                const response = await gapi.client.drive.files.list({
+                    q: "mimeType contains 'video/' and trashed = false", // केवल वीडियो फ़ाइलें
+                    fields: 'nextPageToken, files(id, name, mimeType, thumbnailLink, webContentLink, webViewLink, iconLink)',
+                    spaces: 'drive',
+                    pageSize: 20
+                });
+
+                const files = response.result.files;
+                videoList.innerHTML = '';
+
+                if (files && files.length > 0) {
+                    files.forEach(file => {
+                        const listItem = document.createElement('li');
+                        const videoName = document.createElement('span');
+                        videoName.innerText = file.name;
+
+                        const playButton = document.createElement('button');
+                        playButton.innerText = 'चलाएं';
+                        playButton.onclick = () => playVideo(file);
+
+                        listItem.appendChild(videoName);
+                        listItem.appendChild(playButton);
+                        videoList.appendChild(listItem);
+                    });
+                } else {
+                    videoList.innerHTML = '<li>आपके ड्राइव में कोई वीडियो फ़ाइलें नहीं मिलीं।</li>';
+                }
+
+            } catch (error) {
+                console.error('ड्राइव वीडियो सूचीबद्ध करने में त्रुटि:', error);
+                videoList.innerHTML = `<li class="error-message">वीडियो सूचीबद्ध करने में विफल: ${error.message}</li>`;
+            }
+        }
+
+        /**
+         * एक चयनित वीडियो फ़ाइल चलाता है।
+         */
+        async function playVideo(file) {
+            const accessToken = gapi.auth2.getAuthInstance().currentUser.get().getAuthResponse().access_token;
+            const authenticatedUrl = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media&access_token=${accessToken}`;
+
+            videoPlayer.src = authenticatedUrl;
+            videoPlayer.classList.remove('hidden');
+            videoPlayer.load();
+            videoPlayer.play().catch(e => {
+                console.error('वीडियो चलाने में विफल (प्ले() प्रॉमिसे रिजेक्टेड):', e);
+                uploadStatusText.className = 'error-message';
+                uploadStatusText.innerText = `वीडियो ${file.name} चलाने में त्रुटि। उपयोगकर्ता इंटरेक्शन के बिना ऑटोप्ले ब्लॉक किया जा सकता है।`;
+                // Auto-play might be blocked by browsers, provide a message
+            });
+            uploadStatusText.className = '';
+            uploadStatusText.innerText = `प्ले कर रहा है: ${file.name}`;
+
+            videoPlayer.onerror = (e) => {
+                console.error('वीडियो चलाने में त्रुटि:', e);
+                uploadStatusText.className = 'error-message';
+                uploadStatusText.innerText = `वीडियो ${file.name} चलाने में त्रुटि। यह एक चलाने योग्य प्रारूप या एक्सेस समस्या नहीं हो सकती है।`;
+                if (file.webViewLink) {
+                    alert(`सीधे नहीं चल सका। Google Drive व्यूअर में ${file.name} के लिए खोल रहा है।`);
+                    window.open(file.webViewLink, '_blank');
+                }
+            };
+        }
+
+        // GAPI क्लाइंट लाइब्रेरी लोड करें
+        window.onload = handleClientLoad;
+
+        // यह फ़ंक्शन async स्क्रिप्ट लोडिंग के लिए एक खाली कॉलबैक है।
+        // handleClientLoad पहले से ही window.onload द्वारा बुलाया जा रहा है।
+        function gapiLoaded() {}
+    </script>
+    <script async defer src="https://apis.google.com/js/api.js" onload="gapiLoaded"></script>
+</body>
+</html>
